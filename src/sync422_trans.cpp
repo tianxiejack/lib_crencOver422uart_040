@@ -17,6 +17,7 @@
 using namespace cr_osa;
 
 #define DEBUGMODE	0
+#define DEBUGPRI	0
 #define SPIDEVON	1
 
 #define DATAFORMAT1	1
@@ -29,8 +30,8 @@ using namespace cr_osa;
 #define SYNC422_PORTNUM		1	// portA
 #define RING_VIDEO_TV	0
 #define RING_VIDEO_FR	1
-#define RING_VIDEO_BUFLEN	0x040000	// 256KB
-#define ENC_VIDEO_BUFMAX	0x020000	// 128KB
+#define RING_VIDEO_BUFLEN	0x080000	// 512KB
+#define ENC_VIDEO_BUFMAX	0x040000	// 256KB
 
 typedef struct
 {
@@ -155,7 +156,7 @@ static int spi_dev_write(long context, unsigned char *buf, int len)
 	// add packet interval
 	if(numS % 4)
 	{
-		TailLength = 20-(numS%4); //TailLength = 16+4-(numS%4); //16bytes
+		TailLength = 4-(numS%4);
 		memset(p_buf+numS, 0xFF, TailLength);
 		numS += TailLength;
 	}
@@ -170,14 +171,15 @@ static int spi_dev_write(long context, unsigned char *buf, int len)
 	t2=OSA_getCurTimeInMsec();
 #endif
 
-#if DEBUGMODE
+#if DEBUGPRI
 	{
 		#if (DATAFORMAT == DATAFORMAT1)
 		ENC_EVENTHEADER *pDataHead = (ENC_EVENTHEADER *)p_buf;
 		#elif  (DATAFORMAT == DATAFORMAT2)
 		ENC_EVENTHEADER *pDataHead = (ENC_EVENTHEADER *)(p_buf+3);		// ENC_EVENTHEADER start from ENC_USR54HEADER.data
 		#endif
-		if(((t2-t1) > 0) || ((pDataHead->transno % 25) == 1))
+		//if(((t2-t1) > 0) || ((pDataHead->transno % 25) == 1))
+		if((t2-t1) > 1)
 		{
 			printf(" spi[%d] dtype[%x] packet[%04x] len:%d spiuse %dms\n", 
 					pObj->spiuart, pDataHead->dtype[1], pDataHead->transno, SendTotal, (t2-t1));
@@ -298,6 +300,7 @@ static void* sync422_spi_sendTask(void *pPrm)
 {
 	Sync422_TransObj *pObj = (Sync422_TransObj *)pPrm;
 	//int64 curTime = 0, lastTime = 0;
+	int irunCnt=0;
 
 	unsigned char *pIn=NULL;
 	int bufId=0, iRtn=0;
@@ -327,10 +330,17 @@ static void* sync422_spi_sendTask(void *pPrm)
 	pObj->UsrHead.syncEnd = 0x6F;
 	UsrHeadLen = sizeof(ENC_USR54HEADER);
 
-	OSA_printf(" %d:%s start. \r\n", OSA_getCurTimeInMsec(), __func__);
+	OSA_printf(" %d:%s spi port %d start. \r\n", OSA_getCurTimeInMsec(), __func__, pObj->spiuart);
 	while (pObj->tskLoop == TRUE)
 	{
 		iRtn = OSA_bufGetFull(&pObj->ringQue, &bufId, TIME_OUT/*OSA_TIMEOUT_FOREVER*/); 
+		irunCnt++;
+#if DEBUGPRI
+		if(irunCnt % 5)
+		{
+			OSA_printf(" %d:%s run %d clock %d(%d)\r\n", OSA_getCurTimeInMsec(), __func__, irunCnt, pObj->dataClock, iChangeSpeed[pObj->spiuart]);
+		}
+#endif
 
 #if SPIDEVON
 		if(pObj->dataClock != iChangeSpeed[pObj->spiuart])
@@ -430,8 +440,8 @@ static void* sync422_spi_sendTask(void *pPrm)
 				//printf(" piece[%d] addr %lx len=%d\n", i, (long)p_bufPiece, UsrTailLen);
 				memcpy((p_buf+(i*UsrHeadLen)), &pObj->UsrHead, UsrHeadLen);
 			}
-#if DEBUGMODE
-			if((pObj->DataHead.transno % 25) == 1)
+#if DEBUGPRI
+			if((pObj->DataHead.transno % 250) == 1)
 			{
 				printf(" send dtype[%x] packet[%04x] len:%d to spidev\n", 
 						pObj->DataHead.dtype[1], pObj->DataHead.transno, numS);
@@ -443,6 +453,9 @@ static void* sync422_spi_sendTask(void *pPrm)
 			if(!pObj->dataPause)
 				rtnLen = spi_dev_write((long)pObj, pObj->data_buf, numS);
 				//rtnLen = Sched_h26x_Scheder(dtype, pObj->data_buf, numS, 0, rdSchePrm.pktPiece, spi_dev_write, (long)pObj);
+			if(rtnLen != numS)
+				printf(" send dtype[%x] packet[%04x] len:%d to spidev failed %d\n",
+						pObj->DataHead.dtype[1], pObj->DataHead.transno, numS, rtnLen);
 
 			OSA_bufPutEmpty(&pObj->ringQue, bufId);
 		}
@@ -492,14 +505,15 @@ int sync422_spi_create(int uart, int mode)
 	/** < create ringbuf task loop */
 	//if(mode == RING_VIDEO)
 	{
-		pObj->ringCreate.numBuf = 24;
+		pObj->ringCreate.numBuf = 6;
 	}
 	for (i = 0; i < pObj->ringCreate.numBuf; i++)
 	{
 		pObj->ringCreate.bufVirtAddr[i] = (void *)malloc(RING_VIDEO_BUFLEN);
 		OSA_assert(pObj->ringCreate.bufVirtAddr[i] != NULL);
 	}
-	OSA_bufCreate(&pObj->ringQue, &pObj->ringCreate);
+	if(OSA_bufCreate(&pObj->ringQue, &pObj->ringCreate) != OSA_SOK)
+		printf("ringbuf create failed ! \n");
 	pObj->tskLoop = TRUE;
 	pObj->istskStopDone = FALSE;
 	status = OSA_thrCreate(
@@ -571,6 +585,10 @@ int sync422_spi_pause(int uart, int ipause)
 
 int sync422_ontime_video(int dtype, unsigned char *buf, int len)
 {
+#if DEBUGPRI
+	printf("[sync422]%s: dtype=0x%x buf=%p len=%d(%d); ibInit=0x%x\n",
+			__func__, dtype, buf, len, ENC_VIDEO_BUFMAX, ibInit);
+#endif
 	if((ibInit & 0x01) == 0)
 		return -1;
 	if(buf == NULL)
